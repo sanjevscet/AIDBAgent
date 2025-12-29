@@ -42,3 +42,7 @@ port = "15432"
 database = "quorbit"
 
 ```
+
+NGrok token: 3BoKgdpY7yL7kew2yw9ki_5rrQvjdGFtXMDs6FmRFr7
+
+ngrok config add-authtoken 3BoKgdpY7yL7kew2yw9ki_5rrQvjdGFtXMDs6FmRFr7

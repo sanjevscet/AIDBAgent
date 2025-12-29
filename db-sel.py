@@ -2,7 +2,7 @@ import os
 import re
 
 import streamlit as st
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import StrOutputParser
@@ -60,8 +60,8 @@ def quote_ident(name: str) -> str:
         return f'"{n.replace(chr(34), chr(34) * 2)}"'
     return n
 
-def extract_sql(text: str) -> str:
-    t = (text or "").strip()
+def extract_sql(text_: str) -> str:
+    t = (text_ or "").strip()
     if t.startswith("```"):
         t = t.split("\n", 1)[-1]
         if t.endswith("```"):
@@ -113,6 +113,60 @@ def enforce_limit(sql: str, max_limit: int = MAX_LIMIT) -> str:
 
 
 # ----------------------------
+# ENUM helpers (Option A)
+# ----------------------------
+@st.cache_data(ttl=600)
+def get_enum_labels(db_key: str, _engine, enum_type_name: str) -> list[str]:
+    """
+    Fetch enum labels from Postgres system catalogs by enum type name.
+    Works even if SQLAlchemy doesn't expose .enums.
+    """
+    if not enum_type_name:
+        return []
+
+    q = text("""
+        SELECT e.enumlabel
+        FROM pg_type t
+        JOIN pg_enum e ON t.oid = e.enumtypid
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE t.typname = :typname
+        ORDER BY e.enumsortorder;
+    """)
+
+    try:
+        with _engine.connect() as cxn:
+            rows = cxn.execute(q, {"typname": enum_type_name}).fetchall()
+        return [r[0] for r in rows] if rows else []
+    except Exception:
+        return []
+
+def _fmt_col_for_llm(db_key: str, _engine, col: dict) -> str:
+    """
+    Format a column as: name TYPE or name ENUM('A','B',...)
+    Prefer SQLAlchemy .enums; fallback to pg catalogs using type.name.
+    """
+    col_name = col["name"]
+    col_type = col["type"]
+
+    # 1) Best case: SQLAlchemy enum exposes allowed values
+    enum_vals = getattr(col_type, "enums", None)
+    if enum_vals:
+        vals = ", ".join(repr(v) for v in enum_vals)
+        return f"{col_name} ENUM({vals})"
+
+    # 2) Fallback: try to detect enum type name and query pg catalogs
+    type_name = getattr(col_type, "name", None)  # e.g. 'driver_value_type' etc.
+    if type_name:
+        labels = get_enum_labels(db_key, _engine, type_name)
+        if labels:
+            vals = ", ".join(repr(v) for v in labels)
+            return f"{col_name} ENUM({vals})"
+
+    # 3) Default: include basic type to help the model (kept compact)
+    return f"{col_name} {str(col_type)}"
+
+
+# ----------------------------
 # Schema fetch (tables + compact schema for LLM) — cached PER DB
 # ----------------------------
 @st.cache_data(ttl=600)
@@ -127,18 +181,20 @@ def get_compact_schema_for_llm(db_key: str, _engine) -> str:
     tables = sorted(insp.get_table_names(), key=lambda x: x.lower())
     lines = []
     for t in tables:
-        cols = [c["name"] for c in insp.get_columns(t)]
-        lines.append(f"{t}({', '.join(cols)})")
+        cols = insp.get_columns(t)
+        parts = [_fmt_col_for_llm(db_key, _engine, c) for c in cols]
+        lines.append(f"{t}({', '.join(parts)})")
     return "\n".join(lines)
 
 @st.cache_data(ttl=600)
 def get_schema_for_tables(db_key: str, _engine, table_subset: tuple[str, ...]) -> str:
-    """Return schema only for selected tables (huge token saver)."""
+    """Return schema only for selected tables (huge token saver), including ENUM values."""
     insp = inspect(_engine)
     lines = []
     for t in table_subset:
-        cols = [c["name"] for c in insp.get_columns(t)]
-        lines.append(f"{t}({', '.join(cols)})")
+        cols = insp.get_columns(t)
+        parts = [_fmt_col_for_llm(db_key, _engine, c) for c in cols]
+        lines.append(f"{t}({', '.join(parts)})")
     return "\n".join(lines)
 
 def pick_relevant_tables(prompt: str, tables: list[str], max_tables: int = 3) -> list[str]:
@@ -209,11 +265,15 @@ Schema:
 Rules:
 - Only SELECT or WITH.
 - Always include LIMIT <= {max_limit}.
+- For ENUM columns, use one of the provided ENUM(...) values exactly (case-sensitive).
+- If filtering on text columns (name, email, title, etc.) and the value looks partial or user did not say "exact",
+  use ILIKE with %value%.
 - Return ONLY SQL.
 
 Question: {question}
 SQL:
 """)
+
 
 generate_sql = sql_prompt | llm | StrOutputParser()
 
@@ -261,7 +321,7 @@ with st.sidebar:
         st.session_state.pop("sort_dir", None)
         st.session_state.pop("page", None)
 
-        st.toast(f"🔄 Switched to {db_label}", icon="🔄")
+        st.toast(f"Switched to {db_label}", icon="🔄")
 
     st.divider()
 
@@ -273,7 +333,7 @@ conn = st.connection(st.session_state.active_db, type="sql")
 
 try:
     conn.query("SELECT 1", ttl=0)
-    st.toast(f"✅ Connected to {db_label}", icon="✅")
+    st.toast(f"Connected to {db_label}", icon="✅")
 except Exception as e:
     st.error(f"❌ Connection failed: {e}")
     st.stop()
