@@ -29,26 +29,10 @@ if "preview_table" not in st.session_state:
     st.session_state.preview_table = None
 if "preview_page" not in st.session_state:
     st.session_state.preview_page = 1
-
-# for showing executed write queries
 if "write_logs" not in st.session_state:
-    st.session_state.write_logs = []  # list[dict]: {"sql":..., "params":...}
-
-
-# ----------------------------
-# Pricing / token estimate (approx)
-# ----------------------------
-USD_TO_INR = 90.0
-USD_PER_1M_TOKENS = 0.50  # approx for gemini-2.0-flash total (input+output)
-INR_PER_1M_TOKENS = USD_PER_1M_TOKENS * USD_TO_INR  # = ₹45
-
-def estimate_tokens(text_: str) -> int:
-    if not text_:
-        return 0
-    return max(1, len(text_) // 4)
-
-def estimate_cost_inr(tokens: int) -> float:
-    return (tokens / 1_000_000.0) * INR_PER_1M_TOKENS
+    st.session_state.write_logs = []  # {"sql":..., "params":...}
+if "open_custom_sql" not in st.session_state:
+    st.session_state.open_custom_sql = False
 
 
 # ----------------------------
@@ -76,7 +60,7 @@ def has_multiple_statements(sql: str) -> bool:
     s = (sql or "").strip()
     return s.count(";") > 1
 
-# ✅ safer keyword blocking: match whole SQL keywords only (READ mode)
+# READ-only blocked keywords (LLM-generated SQL)
 BLOCKED_KEYWORDS_READ = [
     "insert", "update", "delete", "drop", "alter", "truncate",
     "create", "grant", "revoke", "copy", "call", "execute"
@@ -87,17 +71,13 @@ def is_safe_select(sql: str) -> bool:
     s = (sql or "").strip()
     if not s:
         return False
-
     low = s.lower()
     if not (low.startswith("select") or low.startswith("with")):
         return False
-
     if has_multiple_statements(s):
         return False
-
     if BLOCKED_RE_READ.search(low):
         return False
-
     return True
 
 MAX_LIMIT = 200
@@ -113,36 +93,167 @@ def enforce_limit(sql: str, max_limit: int = MAX_LIMIT) -> str:
         return s + ";"
     return s + f"\nLIMIT {max_limit};"
 
-
-# ----------------------------
-# ✅ numpy/pandas -> native python converter
-# ----------------------------
 def to_py(v):
     try:
         if pd.isna(v):
             return None
     except Exception:
         pass
-
     try:
         import numpy as np
         if isinstance(v, np.generic):
             return v.item()
     except Exception:
         pass
-
     return v
 
 
 # ----------------------------
-# Editable table (UPDATE/DELETE by PK) helpers
+# Table name normalizer (plural -> singular)
+# ----------------------------
+def normalize_table_names(sql: str, actual_tables: list[str]) -> str:
+    if not sql:
+        return sql
+
+    tables_lower = {t.lower(): t for t in actual_tables}
+
+    def fix_table(token: str) -> str:
+        t = token.strip()
+        tl = t.lower()
+        if tl in tables_lower:
+            return tables_lower[tl]
+        if tl.endswith("s"):
+            singular = tl[:-1]
+            if singular in tables_lower:
+                return tables_lower[singular]
+        return t
+
+    sql = re.sub(
+        r"(?is)\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        lambda m: f"FROM {fix_table(m.group(1))}",
+        sql
+    )
+    sql = re.sub(
+        r"(?is)\bjoin\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        lambda m: f"JOIN {fix_table(m.group(1))}",
+        sql
+    )
+    return sql
+
+
+# ----------------------------
+# ✅ Fix common FK join guesses (driver.driver_id -> driver.id)
+# ----------------------------
+def fix_bad_fk_join(sql: str, table_names: list[str], table_cols_map: dict[str, list[str]]) -> str:
+    """
+    Fix common FK join mistakes like:
+      driver d JOIN driver_category_assignment dca ON d.driver_id = dca.driver_id
+    when driver table doesn't have driver_id but has id.
+
+    Also fixes SELECT DISTINCT d.driver_id -> d.id if driver_id doesn't exist.
+    """
+    if not sql:
+        return sql
+
+    s = sql
+
+    # Parse base table + alias from FROM
+    m_from = re.search(r"(?is)\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+([a-zA-Z_][a-zA-Z0-9_]*))?", s)
+    if not m_from:
+        return s
+
+    base_tbl = m_from.group(1)
+    base_alias = m_from.group(2) or base_tbl
+
+    # normalize base table
+    actual_map = {t.lower(): t for t in table_names}
+    base_tbl_actual = actual_map.get(base_tbl.lower(), base_tbl)
+
+    base_cols = [c.lower() for c in table_cols_map.get(base_tbl_actual, [])]
+
+    # If driver_id not in base table but id exists, fix SELECT alias.driver_id -> alias.id
+    if "driver_id" not in base_cols and "id" in base_cols:
+        s = re.sub(
+            rf"(?is)\b{re.escape(base_alias)}\.driver_id\b",
+            f"{base_alias}.id",
+            s
+        )
+
+        # Fix JOIN pattern: alias.driver_id = other.driver_id -> alias.id = other.driver_id
+        s = re.sub(
+            rf"(?is)\b{re.escape(base_alias)}\.driver_id\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*\.)?driver_id\b",
+            f"{base_alias}.id = \\1driver_id",
+            s
+        )
+
+    return s
+
+
+# ----------------------------
+# ✅ "latest/newest/recent" ORDER BY fixer (prefer id DESC) + JOIN-safe
+# ----------------------------
+def prefer_id_order_for_latest(sql: str, table_names: list[str], table_to_cols: dict[str, list[str]]) -> str:
+    """
+    If ORDER BY uses created_at/updated_at OR plain 'id' in a joined query,
+    prefer ORDER BY <base_alias>.id DESC (if id exists on base table).
+    Also fixes ambiguous ORDER BY id when JOIN exists.
+    """
+    if not sql:
+        return sql
+
+    s = sql
+
+    # FROM driver d  -> base_tbl=driver, base_alias=d (alias optional)
+    m = re.search(r"(?is)\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+([a-zA-Z_][a-zA-Z0-9_]*))?", s)
+    if not m:
+        return s
+
+    base_tbl = m.group(1)
+    base_alias = m.group(2)  # may be None
+
+    actual_map = {t.lower(): t for t in table_names}
+    actual_tbl = actual_map.get(base_tbl.lower(), base_tbl)
+
+    cols = table_to_cols.get(actual_tbl, [])
+    cols_l = [c.lower() for c in cols]
+    if "id" not in cols_l:
+        return s
+
+    id_col = cols[cols_l.index("id")]
+    id_expr = f"{base_alias}.{quote_ident(id_col)}" if base_alias else f"{quote_ident(id_col)}"
+
+    has_join = re.search(r"(?is)\bjoin\b", s) is not None
+
+    # (A) Fix ambiguous ORDER BY id in join queries
+    if has_join or base_alias:
+        s = re.sub(
+            r"(?is)\border\s+by\s+id(\s+(asc|desc))?\b",
+            lambda _mm: f"ORDER BY {id_expr} DESC",
+            s
+        )
+
+    # (B) Replace created_at/updated_at ordering -> id ordering (qualified)
+    s = re.sub(
+        r"(?is)\border\s+by\s+(created_at|updated_at|createdon|updatedon|created|updated|timestamp|time|date)(\s+(asc|desc))?\b",
+        lambda _mm: f"ORDER BY {id_expr} DESC",
+        s
+    )
+
+    # (C) If no ORDER BY but has LIMIT, add ORDER BY <alias>.id DESC
+    if (re.search(r"(?is)\blimit\b", s) is not None) and (re.search(r"(?is)\border\s+by\b", s) is None):
+        s = re.sub(r"(?is)\blimit\b", f"ORDER BY {id_expr} DESC\nLIMIT", s, count=1)
+
+    return s
+
+
+# ----------------------------
+# Editable table helpers (PK based update/delete)
 # ----------------------------
 def get_primary_key_cols(_engine, table_name: str) -> list[str]:
     insp = inspect(_engine)
     try:
         pk = insp.get_pk_constraint(table_name) or {}
-        cols = pk.get("constrained_columns") or []
-        return cols
+        return pk.get("constrained_columns") or []
     except Exception:
         return []
 
@@ -188,15 +299,12 @@ def diff_rows(original_df: pd.DataFrame, edited_df: pd.DataFrame, pk_cols: list[
 
     updates = []
     common_keys = orig_map.index.intersection(edt_map.index)
-
-    # compute row keys once for delete-skip check
     edt_cmp_key = pk_key(edt_cmp)
 
     for k in common_keys:
         o = orig_map.loc[k]
         e = edt_map.loc[k]
 
-        # skip if marked delete
         if delete_col in edt.columns:
             row_mask = edt_cmp_key == k
             if any(row_mask):
@@ -226,50 +334,101 @@ def diff_rows(original_df: pd.DataFrame, edited_df: pd.DataFrame, pk_cols: list[
 
 
 # ----------------------------
-# ENUM helpers (Option A)
+# Custom SQL runner (Allowlist: SELECT/INSERT/UPDATE/DELETE only)
 # ----------------------------
-@st.cache_data(ttl=600)
-def get_enum_labels(db_key: str, _engine, enum_type_name: str) -> list[str]:
-    if not enum_type_name:
-        return []
+FORBIDDEN_KEYWORDS = [
+    "drop", "alter", "truncate", "create", "grant", "revoke",
+    "copy", "call", "execute", "vacuum", "analyze", "refresh",
+    "cluster", "reindex", "attach", "detach"
+]
+FORBIDDEN_RE = re.compile(r"(?is)\b(" + "|".join(FORBIDDEN_KEYWORDS) + r")\b")
 
-    q = text("""
-        SELECT e.enumlabel
-        FROM pg_type t
-        JOIN pg_enum e ON t.oid = e.enumtypid
-        JOIN pg_namespace n ON n.oid = t.typnamespace
-        WHERE t.typname = :typname
-        ORDER BY e.enumsortorder;
-    """)
+def strip_sql_comments(sql: str) -> str:
+    s = re.sub(r"(?is)/\*.*?\*/", " ", sql or "")
+    s = re.sub(r"(?m)--.*?$", " ", s)
+    return s
 
-    try:
-        with _engine.connect() as cxn:
-            rows = cxn.execute(q, {"typname": enum_type_name}).fetchall()
-        return [r[0] for r in rows] if rows else []
-    except Exception:
-        return []
+def normalize_sql(sql: str) -> str:
+    s = extract_sql(sql or "")
+    s = strip_sql_comments(s)
+    s = s.strip()
+    if s.endswith(";"):
+        s = s[:-1].rstrip()
+    return s
 
-def _fmt_col_for_llm(db_key: str, _engine, col: dict) -> str:
-    col_name = col["name"]
-    col_type = col["type"]
+def classify_sql(sql: str) -> str:
+    s = (sql or "").strip().lower()
+    if s.startswith("with"):
+        return "with"
+    if s.startswith("select"):
+        return "select"
+    if s.startswith("insert"):
+        return "insert"
+    if s.startswith("update"):
+        return "update"
+    if s.startswith("delete"):
+        return "delete"
+    return "other"
 
-    enum_vals = getattr(col_type, "enums", None)
-    if enum_vals:
-        vals = ", ".join(repr(v) for v in enum_vals)
-        return f"{col_name} ENUM({vals})"
+def has_where_clause(sql: str) -> bool:
+    return re.search(r"(?is)\bwhere\b", sql or "") is not None
 
-    type_name = getattr(col_type, "name", None)
-    if type_name:
-        labels = get_enum_labels(db_key, _engine, type_name)
-        if labels:
-            vals = ", ".join(repr(v) for v in labels)
-            return f"{col_name} ENUM({vals})"
+def is_single_statement(sql: str) -> bool:
+    return (sql or "").count(";") == 0
 
-    return f"{col_name} {str(col_type)}"
+def validate_custom_sql(sql: str) -> tuple[bool, str, str]:
+    s = normalize_sql(sql)
+    if not s:
+        return False, "other", "Empty SQL"
+    if not is_single_statement(s):
+        return False, "other", "Only single statement allowed (no multiple ';')"
+    if FORBIDDEN_RE.search(s):
+        return False, "other", "Forbidden keyword found (DDL/admin ops blocked)"
+
+    kind = classify_sql(s)
+    if kind == "other":
+        return False, kind, "Only SELECT / INSERT / UPDATE / DELETE are allowed"
+
+    if kind in ("update", "delete") and not has_where_clause(s):
+        return False, kind, f"{kind.upper()} must include WHERE (full-table ops blocked)"
+
+    return True, kind, "OK"
+
+def enforce_limit_for_select_or_with(sql: str, max_limit: int = MAX_LIMIT) -> str:
+    s = normalize_sql(sql)
+    low = s.lower().lstrip()
+    if low.startswith("select"):
+        return enforce_limit(s, max_limit).strip().rstrip(";")
+    if low.startswith("with"):
+        if re.search(r"(?is)\bwith\b.*\bselect\b", s) and not re.search(r"(?is)\bwith\b.*\b(insert|update|delete)\b", s):
+            return enforce_limit(s, max_limit).strip().rstrip(";")
+    return s
+
+def run_custom_sql(conn, sql: str):
+    s = normalize_sql(sql)
+    kind = classify_sql(s)
+
+    if kind in ("select", "with"):
+        s2 = enforce_limit_for_select_or_with(s, MAX_LIMIT)
+        df = conn.query(s2, ttl=0)
+        return {"kind": "select", "sql": s2, "df": df}
+
+    with conn.engine.begin() as cxn:
+        result = cxn.execute(text(s))
+        returning_rows = None
+        try:
+            rows = result.fetchall()
+            returning_rows = [dict(r._mapping) for r in rows]
+        except Exception:
+            returning_rows = None
+        rowcount = getattr(result, "rowcount", None)
+
+    df_ret = pd.DataFrame(returning_rows) if returning_rows else None
+    return {"kind": kind, "sql": s, "rowcount": rowcount, "returning_df": df_ret}
 
 
 # ----------------------------
-# Schema fetch — cached PER DB
+# Schema fetch (tables + columns map)
 # ----------------------------
 @st.cache_data(ttl=600)
 def get_tables_sorted(db_key: str, _engine) -> list[str]:
@@ -277,50 +436,13 @@ def get_tables_sorted(db_key: str, _engine) -> list[str]:
     return sorted(insp.get_table_names(), key=lambda x: x.lower())
 
 @st.cache_data(ttl=600)
-def get_compact_schema_for_llm(db_key: str, _engine) -> str:
+def get_table_columns_map(db_key: str, _engine, tables: tuple[str, ...]) -> dict[str, list[str]]:
     insp = inspect(_engine)
-    tables = sorted(insp.get_table_names(), key=lambda x: x.lower())
-    lines = []
+    out = {}
     for t in tables:
-        cols = insp.get_columns(t)
-        parts = [_fmt_col_for_llm(db_key, _engine, c) for c in cols]
-        lines.append(f"{t}({', '.join(parts)})")
-    return "\n".join(lines)
-
-@st.cache_data(ttl=600)
-def get_schema_for_tables(db_key: str, _engine, table_subset: tuple[str, ...]) -> str:
-    insp = inspect(_engine)
-    lines = []
-    for t in table_subset:
-        cols = insp.get_columns(t)
-        parts = [_fmt_col_for_llm(db_key, _engine, c) for c in cols]
-        lines.append(f"{t}({', '.join(parts)})")
-    return "\n".join(lines)
-
-def pick_relevant_tables(prompt: str, tables: list[str], max_tables: int = 3) -> list[str]:
-    q = (prompt or "").lower()
-    words = re.findall(r"[a-zA-Z_]+", q)
-
-    scored = []
-    for t in tables:
-        tl = t.lower()
-        score = 0
-        if tl in q:
-            score += 5
-        for w in words:
-            w0 = w.rstrip("s")
-            t0 = tl.rstrip("s")
-            if w == tl:
-                score += 4
-            if w0 == t0:
-                score += 3
-            if w in tl or tl in w:
-                score += 1
-        if score > 0:
-            scored.append((score, t))
-
-    scored.sort(reverse=True)
-    return [t for _, t in scored[:max_tables]]
+        cols = [c["name"] for c in insp.get_columns(t)]
+        out[t] = cols
+    return out
 
 
 # ----------------------------
@@ -354,19 +476,11 @@ except Exception as e:
 sql_prompt = PromptTemplate.from_template("""
 You are a PostgreSQL expert. Output ONE SELECT query only.
 
-Use ONLY the schema below. Do NOT guess columns.
-Prefer simple queries. Avoid joins unless asked.
-If user asks "latest/newest/recent", order by id DESC (if id exists).
-
-Schema:
-{schema}
-
 Rules:
 - Only SELECT or WITH.
 - Always include LIMIT <= {max_limit}.
-- For ENUM columns, use one of the provided ENUM(...) values exactly (case-sensitive).
-- If filtering on text columns (name, email, title, etc.) and the value looks partial or user did not say "exact",
-  use ILIKE with %value%.
+- If user asks "latest/newest/recent", order by id DESC (prefer id).
+- If filtering on text columns (name, email, title, etc.) and value looks partial, use ILIKE with %value%.
 - Return ONLY SQL.
 
 Question: {question}
@@ -388,13 +502,12 @@ answer_chain = answer_prompt | llm | StrOutputParser()
 
 
 # ----------------------------
-# Sidebar: DB select + Table editing toggle + Table select
+# Sidebar: compact layout
 # ----------------------------
 with st.sidebar:
-    st.header("🗄️ Database")
-
+    st.caption("🗄️ Database")
     db_choice = st.selectbox(
-        "Select DB",
+        "DB",
         options=[
             ("Volume DB", "postgresql_volume"),
             ("Quorbit DB", "postgresql_quorbit"),
@@ -402,6 +515,7 @@ with st.sidebar:
         format_func=lambda x: x[0],
         index=0,
         key="db_choice",
+        label_visibility="collapsed",
     )
 
     db_label, db_conn_name = db_choice
@@ -411,6 +525,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.preview_table = None
         st.session_state.preview_page = 1
+        st.session_state.write_logs = []
+        st.session_state.open_custom_sql = False
         st.session_state.pop("selected_table", None)
 
         st.session_state.pop("page_size", None)
@@ -420,24 +536,18 @@ with st.sidebar:
 
         st.toast(f"Switched to {db_label}", icon="🔄")
 
-    st.divider()
+    cA, cB = st.columns([1, 1])
+    with cA:
+        edit_enabled = st.toggle("Edit", value=False, key="edit_enabled")
+    with cB:
+        if st.button("🧪 SQL", width='stretch'):
+            st.session_state.open_custom_sql = True
 
-    st.header("📝 Edit")
-    # ✅ ONLY sidebar toggle; main screen won't show this toggle or helper text
-    edit_enabled = st.toggle("Enable table edit (Update/Delete)", value=False, key="edit_enabled")
-
-    # Optional: lock edits behind passcode (recommended)
     write_ok = True
     expected = st.secrets.get("WRITE_PASSCODE") or os.getenv("WRITE_PASSCODE")
     if edit_enabled and expected:
-        passcode = st.text_input("Passcode", type="password")
+        passcode = st.text_input("Passcode", type="password", label_visibility="collapsed")
         write_ok = passcode == expected
-        if write_ok:
-            st.success("Unlocked ✅")
-        else:
-            st.warning("Enter correct passcode")
-
-    st.divider()
 
 
 # ----------------------------
@@ -453,37 +563,93 @@ except Exception as e:
     st.stop()
 
 table_names = get_tables_sorted(st.session_state.active_db, conn.engine)
-schema_full_compact = get_compact_schema_for_llm(st.session_state.active_db, conn.engine)
+table_cols_map = get_table_columns_map(st.session_state.active_db, conn.engine, tuple(table_names))
 
 with st.sidebar:
-    st.header("📊 Tables")
-
+    st.caption("📊 Tables")
     selected_table = st.selectbox(
-        "Select table",
+        "Table",
         options=table_names,
         index=None,
-        placeholder="Select a table…",
+        placeholder="Select table…",
         key="selected_table",
+        label_visibility="collapsed",
     )
 
-    st.divider()
-    if st.button("Clear screen", width='stretch'):
+    if st.button("🧼 Clear screen", width='stretch'):
         st.session_state.messages = []
         st.session_state.preview_table = None
         st.session_state.preview_page = 1
-        st.session_state.pop("selected_table", None)
         st.session_state.write_logs = []
+        st.session_state.open_custom_sql = False
+        st.session_state.pop("selected_table", None)
         st.toast("🧼 Cleared!", icon="🧼")
-        st.rerun()
-
-    if st.button("🔄 Refresh schema cache", width='stretch'):
-        st.cache_data.clear()
-        st.toast("Schema cache cleared ✅", icon="✅")
         st.rerun()
 
 
 # ----------------------------
-# Main: Table Preview (editable only if sidebar edit_enabled)
+# Center screen: Custom SQL Runner panel (NO modal/dialog)
+# ----------------------------
+if st.session_state.open_custom_sql:
+    st.markdown("---")
+    st.markdown("### 🧪 Custom SQL Runner (SELECT/INSERT/UPDATE/DELETE only)")
+    st.caption("DDL/admin ops blocked. UPDATE/DELETE must include WHERE.")
+
+    sql_in = st.text_area(
+        "SQL",
+        height=220,
+        placeholder="SELECT * FROM driver WHERE name ILIKE '%san%' LIMIT 50;\n\nUPDATE driver SET name='X' WHERE id=108 RETURNING *;"
+    )
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        run_btn = st.button("▶️ Run", width='stretch')
+    with c2:
+        if st.button("✖ Close", width='stretch'):
+            st.session_state.open_custom_sql = False
+            st.rerun()
+
+    if run_btn:
+        try:
+            ok, kind, msg = validate_custom_sql(sql_in)
+            if not ok:
+                raise ValueError(msg)
+
+            normalized = normalize_sql(sql_in)
+            is_write = kind in ("insert", "update", "delete") or (
+                kind == "with" and re.search(r"(?is)\b(insert|update|delete)\b", normalized)
+            )
+
+            if is_write and not (edit_enabled and write_ok):
+                raise ValueError("Write SQL detected. Sidebar me Edit ON + passcode required (if configured).")
+
+            if is_write:
+                confirm = st.checkbox("✅ I confirm executing this INSERT/UPDATE/DELETE", value=False, key="confirm_custom_dml_inline")
+                if not confirm:
+                    st.info("Not executed. Tick confirmation to run.")
+                    st.stop()
+
+            out = run_custom_sql(conn, sql_in)
+
+            st.caption("🧾 Executed SQL")
+            st.code(out["sql"], language="sql")
+
+            if out["kind"] == "select":
+                st.dataframe(out["df"], width='stretch', height=360)
+            else:
+                st.success(f"✅ Done. Rowcount: {out.get('rowcount')}")
+                if out.get("returning_df") is not None and not out["returning_df"].empty:
+                    st.write("RETURNING rows:")
+                    st.dataframe(out["returning_df"], width='stretch', height=300)
+
+            st.session_state.write_logs.append({"sql": out["sql"], "params": {}})
+
+        except Exception as e:
+            st.error(f"Bhai error aa gaya 😅: {e}")
+
+
+# ----------------------------
+# Main: Table Preview
 # ----------------------------
 st.markdown("**📋 Table Preview**")
 
@@ -547,14 +713,12 @@ else:
     st.caption(f"**{selected_table}** — Rows {offset + 1} to {offset + len(df_preview)}")
 
     if not (edit_enabled and write_ok):
-        # ✅ No "Editable mode" and no helper hint shown in main screen
         st.dataframe(df_preview, width='stretch', height=420)
     else:
         if not pk_cols:
             st.warning("PRIMARY KEY nahi mila, isliye safe reason se edit disabled.")
             st.dataframe(df_preview, width='stretch', height=420)
         else:
-            # ✅ Editable table WITHOUT showing "Editable mode" hint text
             st.session_state.orig_page_df = df_preview.copy()
 
             df_edit = df_preview.copy()
@@ -566,19 +730,16 @@ else:
                 width='stretch',
                 height=420,
                 num_rows="fixed",
-                disabled=pk_cols,  # lock PK columns
+                disabled=pk_cols,
                 key=f"editor_{selected_table}_{st.session_state.preview_page}",
             )
-
             edited = edited.applymap(to_py)
 
-            # Show executed queries (if any) ABOVE apply button, compact
             if st.session_state.write_logs:
-                with st.expander("🧾 Last executed UPDATE/DELETE queries", expanded=False):
+                with st.expander("🧾 Executed query history (latest)", expanded=False):
                     for i, item in enumerate(st.session_state.write_logs[-20:], start=1):
                         st.caption(f"#{i}")
                         st.code(item["sql"], language="sql")
-                        st.json(item["params"])
 
             left, right = st.columns([1, 1])
             with left:
@@ -603,7 +764,6 @@ else:
                     logs = []
 
                     with conn.engine.begin() as cxn:
-                        # deletes
                         del_sql = build_delete_sql(safe_table_sql, pk_cols)
                         for d in deletes:
                             params = {f"pk_{c}": to_py(d[c]) for c in pk_cols}
@@ -611,7 +771,6 @@ else:
                             rows = cxn.execute(text(del_sql), params).fetchall()
                             deleted_rows.extend([dict(r._mapping) for r in rows])
 
-                        # updates
                         for u in updates:
                             set_cols = u["__set_cols__"]
                             upd_sql = build_update_sql(safe_table_sql, set_cols, pk_cols)
@@ -620,17 +779,15 @@ else:
                             rows = cxn.execute(text(upd_sql), params).fetchall()
                             updated_rows.extend([dict(r._mapping) for r in rows])
 
-                    # ✅ store logs (show on screen)
-                    st.session_state.write_logs = (st.session_state.write_logs + logs)[-50:]
+                    st.session_state.write_logs = (st.session_state.write_logs + logs)[-100:]
 
                     st.success(f"✅ Applied: {len(updates)} update(s), {len(deletes)} delete(s)")
 
-                    if logs:
-                        with st.expander("🧾 Executed queries (this apply)", expanded=True):
-                            for i, item in enumerate(logs, start=1):
-                                st.caption(f"#{i}")
-                                st.code(item["sql"], language="sql")
-                                st.json(item["params"])
+                    with st.expander("🧾 Executed queries (this apply)", expanded=True):
+                        for i, item in enumerate(logs, start=1):
+                            st.caption(f"#{i}")
+                            st.code(item["sql"], language="sql")
+                            st.json(item["params"])
 
                     if updated_rows:
                         st.write("Updated rows (RETURNING):")
@@ -647,7 +804,7 @@ else:
 
 
 # ----------------------------
-# Chat history render
+# Chat history
 # ----------------------------
 st.markdown("---")
 st.markdown("**💬 Chat (Read-only)**")
@@ -661,7 +818,7 @@ for message in st.session_state.messages:
 
 
 # ----------------------------
-# Chat input + execution + token/cost display (READ ONLY)
+# Chat input + execution (READ ONLY) + plural fix + fk join fix + latest id fix
 # ----------------------------
 if prompt := st.chat_input("Ask DB (read-only)..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -670,17 +827,17 @@ if prompt := st.chat_input("Ask DB (read-only)..."):
 
     with st.chat_message("assistant"):
         try:
-            candidate_tables = [selected_table] if selected_table else pick_relevant_tables(prompt, table_names, max_tables=3)
-
-            if candidate_tables:
-                schema_small = get_schema_for_tables(
-                    st.session_state.active_db, conn.engine, tuple(candidate_tables)
-                )
-            else:
-                schema_small = schema_full_compact
-
-            sql_raw = generate_sql.invoke({"question": prompt, "schema": schema_small, "max_limit": str(MAX_LIMIT)})
+            sql_raw = generate_sql.invoke({"question": prompt, "max_limit": str(MAX_LIMIT)})
             sql_query = extract_sql(sql_raw)
+
+            # 1) fix plural table names
+            sql_query = normalize_table_names(sql_query, table_names)
+
+            # 2) fix common FK join mistakes like driver.driver_id -> driver.id
+            sql_query = fix_bad_fk_join(sql_query, table_names, table_cols_map)
+
+            # 3) prefer id desc and fix ORDER BY id ambiguity on joins
+            sql_query = prefer_id_order_for_latest(sql_query, table_names, table_cols_map)
 
             if not is_safe_select(sql_query):
                 raise ValueError(f"Unsafe SQL:\n{sql_query}")
@@ -696,28 +853,6 @@ if prompt := st.chat_input("Ask DB (read-only)..."):
             raw_rows = df.head(10).to_dict(orient="records")
             response = answer_chain.invoke({"question": prompt, "response": raw_rows})
             st.markdown(response)
-
-            prompt_tokens = estimate_tokens(prompt)
-            schema_tokens = estimate_tokens(schema_small)
-            sql_tokens = estimate_tokens(sql_query)
-            result_tokens = estimate_tokens(str(raw_rows))
-            answer_tokens = estimate_tokens(response)
-            total_tokens = prompt_tokens + schema_tokens + sql_tokens + result_tokens + answer_tokens
-
-            cost_total = estimate_cost_inr(total_tokens)
-            cost_schema = estimate_cost_inr(schema_tokens)
-            cost_result = estimate_cost_inr(result_tokens)
-
-            with st.expander("📊 Token & Cost (estimated)", expanded=False):
-                st.write(f"🧠 Prompt: ~{prompt_tokens} tokens (₹{estimate_cost_inr(prompt_tokens):.4f})")
-                st.write(f"🗂️ Schema: ~{schema_tokens} tokens (₹{cost_schema:.4f})")
-                st.write(f"🧾 SQL: ~{sql_tokens} tokens (₹{estimate_cost_inr(sql_tokens):.4f})")
-                st.write(f"📋 Result sample: ~{result_tokens} tokens (₹{cost_result:.4f})")
-                st.write(f"💬 Answer: ~{answer_tokens} tokens (₹{estimate_cost_inr(answer_tokens):.4f})")
-                st.markdown(f"### ✅ Total: ~**{total_tokens} tokens** → **₹{cost_total:.4f}**")
-                if candidate_tables:
-                    st.caption(f"Schema reduced ✅ tables used: {', '.join(candidate_tables)}")
-                st.caption(f"USD→INR=90, approx pricing used: $0.50 / 1M tokens (~₹45 / 1M)")
 
             st.session_state.messages.append({"role": "assistant", "content": response, "sql": sql_query})
 
