@@ -2,6 +2,10 @@ streamlit>=1.30.0
 pandas
 sqlalchemy
 psycopg2-binary
+
 langchain
+langchain-core
 langchain-community
-langchain-ollama
+
+langchain-google-genai
+google-generativeai
